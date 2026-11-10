@@ -41,7 +41,10 @@ function inteiros(lista) {
 
 /**
  * Regra da carteira: receita a receber, em aberto, não é provisão, empresa da lista,
- * cliente externo (o parceiro não é uma das empresas do grupo) e vencido há mais de X dias.
+ * cliente externo (o parceiro não é uma das empresas do grupo) e:
+ *  - com DIAS_A_VENCER > 0: tudo que vence até hoje + X dias. O Notion separa sozinho, pela
+ *    "Faixa de vencimento", o que está a vencer, vencido até 7 dias e vencido há mais de 7 dias;
+ *  - com DIAS_A_VENCER = 0: só os vencidos há mais de DIAS_ATRASO dias.
  * Títulos renegociados saem sozinhos: o Sankhya tira o original da carteira a receber.
  */
 function regraCarteira() {
@@ -51,7 +54,9 @@ function regraCarteira() {
     "NVL(FIN.PROVISAO, 'N') = 'N'",
     `FIN.CODEMP IN (${inteiros(config.empresas)})`,
     'FIN.CODPARC NOT IN (SELECT E.CODPARC FROM TSIEMP E WHERE E.CODPARC IS NOT NULL)',
-    `TRUNC(FIN.DTVENC) < TRUNC(SYSDATE) - ${Number(config.diasAtraso)}`,
+    config.diasAVencer > 0
+      ? `TRUNC(FIN.DTVENC) <= TRUNC(SYSDATE) + ${Number(config.diasAVencer)}`
+      : `TRUNC(FIN.DTVENC) < TRUNC(SYSDATE) - ${Number(config.diasAtraso)}`,
   ];
   if (config.diasAtrasoMaximo != null) {
     partes.push(`TRUNC(FIN.DTVENC) >= TRUNC(SYSDATE) - ${Number(config.diasAtrasoMaximo)}`);

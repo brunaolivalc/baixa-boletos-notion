@@ -1,8 +1,9 @@
 /**
- * Rotina diária de títulos: Sankhya -> base "Posição de Cobrança" no Notion.
+ * Rotina diária de TÍTULOS: Sankhya -> base "Posição de Cobrança" no Notion.
  *
- * 1. Lê a carteira inteira no Sankhya: a receber, em aberto, cliente externo,
- *    empresas 1 a 9, vencidos há mais de 7 dias. Se a leitura falhar, para sem mexer no Notion.
+ * 1. Lê a carteira inteira no Sankhya: a receber, em aberto, cliente externo, empresas 1 a 9,
+ *    tudo que vence até hoje + DIAS_A_VENCER (a vencer e vencidos). O Notion separa as visões
+ *    sozinho pela "Faixa de vencimento". Se a leitura falhar, para sem mexer no Notion.
  * 2. Lê todos os cards de títulos do Notion (Chave Sankhya = TIT:<NUFIN>).
  * 3. Chave nova -> cria o card (Em aberto / A tratar + cabeçalho "Histórico de tratativas").
  *    Chave que já existe -> não altera nada (fotografia da inclusão).
@@ -11,8 +12,6 @@
  *    - baixa parcial, renegociação, título não encontrado ou vencimento alterado:
  *      mantém o card e registra a exceção para revisão.
  */
-import { mkdir, writeFile } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
 import { chaveDoTitulo, LOJAS, POLOS } from './campos.js';
 import { buscarTitulosVencidos, consultarSituacao } from './titulos.js';
@@ -20,57 +19,14 @@ import {
   criarClienteNotion, abrirBase, listarPaginas, vencimentoNoNotion,
   montarPropriedades, criarPagina, excluirPagina,
 } from './notion.js';
-
-const PASTA_SAIDA = fileURLToPath(new URL('../saida/', import.meta.url));
-
-/** Planilha da conferência (abre direto no Excel em português). */
-async function salvarPlanilhaConferencia(novos, remocoes, excecoes) {
-  const num = (v) => (v == null ? '' : String(v).replace('.', ','));
-  const cel = (v) => {
-    const s = v == null ? '' : String(v).replace(/\s+/g, ' ').trim();
-    return /[;"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  const linhas = [[
-    'Ação', 'Chave Sankhya', 'Código da empresa', 'Loja', 'Polo', 'Cliente', 'Código do parceiro',
-    'Nro Nota', 'Desdobramento', 'Vencimento', 'Dias de atraso', 'Valor do desdobramento',
-    'Valor líquido', 'Tipo de título', 'Código de operação', 'Histórico', 'Motivo',
-  ]];
-  for (const t of novos) {
-    linhas.push([
-      'Incluir', chaveDoTitulo(t), t.CODEMP, LOJAS[t.CODEMP] ?? '', POLOS[t.CODEMP] ?? '', t.NOMEPARC, t.CODPARC,
-      t.NUMNOTA || '', t.DESDOBRAMENTO, dataBR(t.DTVENC), t.DIAS_ATRASO, num(t.VLRDESDOB),
-      num(t.VLRLIQUIDO), `${t.CODTIPTIT} - ${t.DESCRTIPTIT ?? ''}`, t.CODTIPOPER, t.HISTORICO, '',
-    ]);
-  }
-  for (const r of remocoes) linhas.push(['Remover', r.chave, ...Array(14).fill(''), r.motivo]);
-  for (const e of excecoes) linhas.push(['Revisar', e.chave, ...Array(14).fill(''), e.motivo]);
-
-  await mkdir(PASTA_SAIDA, { recursive: true });
-  const dia = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
-  const arquivo = `${PASTA_SAIDA}conferencia-titulos-${dia}.csv`;
-  await writeFile(arquivo, '﻿' + linhas.map((l) => l.map(cel).join(';')).join('\r\n'), 'utf8');
-  return arquivo;
-}
-
-const SIMULTANEOS = 3; // a API do Notion aceita ~3 chamadas por segundo
-
-const agora = () => new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
-const log = (...args) => console.log(`[${agora()}]`, ...args);
-const dataBR = (iso) => (iso ? iso.split('-').reverse().join('/') : '?');
-const brl = (v) => (v == null ? '?' : v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }));
-
-async function emParalelo(itens, fn) {
-  let proximo = 0;
-  const trabalhador = async () => {
-    while (proximo < itens.length) await fn(itens[proximo++]);
-  };
-  await Promise.all(Array.from({ length: Math.min(SIMULTANEOS, itens.length) }, trabalhador));
-}
+import { agora, log, dataBR, brl, emParalelo, salvarPlanilha } from './util.js';
 
 function descreverRegra() {
-  return `empresas ${config.empresas.join(',')} | a receber | em aberto | cliente externo | ` +
-    `vencidos há mais de ${config.diasAtraso} dias` +
-    (config.diasAtrasoMaximo != null ? ` e no máximo ${config.diasAtrasoMaximo}` : '') +
+  const prazo = config.diasAVencer > 0
+    ? `vencidos e a vencer até ${config.diasAVencer} dias`
+    : `vencidos há mais de ${config.diasAtraso} dias`;
+  return `empresas ${config.empresas.join(',')} | a receber | em aberto | cliente externo | ${prazo}` +
+    (config.diasAtrasoMaximo != null ? ` | atraso máximo ${config.diasAtrasoMaximo} dias` : '') +
     (config.tiposTitulo.length ? ` | só tipos ${config.tiposTitulo.join(',')}` : '') +
     (config.tiposTituloIgnorar.length ? ` | sem os tipos ${config.tiposTituloIgnorar.join(',')}` : '') +
     (config.parceirosIgnorar.length ? ` | sem os parceiros ${config.parceirosIgnorar.join(',')}` : '');
@@ -90,7 +46,41 @@ function classificarSaida(s) {
   return { manter: `em aberto, mas saiu da regra (vencimento atual ${dataBR(s.vencimento)})` };
 }
 
-export async function sincronizar({ simular = false, notion = criarClienteNotion() } = {}) {
+function faixa(diasAtraso) {
+  if (diasAtraso < 0) return 'A vencer';
+  if (diasAtraso === 0) return 'Vence hoje';
+  if (diasAtraso <= 7) return 'Vencido até 7 dias';
+  return 'Vencido há mais de 7 dias';
+}
+
+function planilhaConferencia(novos, remocoes, excecoes) {
+  const linhas = [[
+    'Ação', 'Chave Sankhya', 'Faixa', 'Código da empresa', 'Loja', 'Polo', 'Cliente', 'Código do parceiro',
+    'Nro Nota', 'Desdobramento', 'Vencimento', 'Dias de atraso', 'Valor do desdobramento',
+    'Valor líquido', 'Tipo de título', 'Código de operação', 'Histórico', 'Motivo',
+  ]];
+  for (const t of novos) {
+    linhas.push([
+      'Incluir', chaveDoTitulo(t), faixa(t.DIAS_ATRASO), t.CODEMP, LOJAS[t.CODEMP] ?? '', POLOS[t.CODEMP] ?? '',
+      t.NOMEPARC, t.CODPARC, t.NUMNOTA || '', t.DESDOBRAMENTO, dataBR(t.DTVENC), t.DIAS_ATRASO,
+      t.VLRDESDOB, t.VLRLIQUIDO, `${t.CODTIPTIT} - ${t.DESCRTIPTIT ?? ''}`, t.CODTIPOPER, t.HISTORICO, '',
+    ]);
+  }
+  for (const r of remocoes) linhas.push(['Remover', r.chave, ...Array(15).fill(''), r.motivo]);
+  for (const e of excecoes) linhas.push(['Revisar', e.chave, ...Array(15).fill(''), e.motivo]);
+  return salvarPlanilha('conferencia-titulos', linhas);
+}
+
+export function mostrarCard(chave, props) {
+  log(`Exemplo de card (${chave}):`);
+  for (const [coluna, v] of Object.entries(props)) {
+    const valor = v.title?.[0]?.text.content ?? v.rich_text?.[0]?.text.content ?? v.select?.name ??
+      v.status?.name ?? v.date?.start ?? v.number ?? '(vazio)';
+    log(`  ${coluna.padEnd(28)} ${String(valor).slice(0, 90)}`);
+  }
+}
+
+export async function sincronizarTitulos({ simular = false, notion = criarClienteNotion() } = {}) {
   log(`Rotina de títulos${simular ? ' (MODO CONFERÊNCIA: nada será gravado no Notion)' : ''}`);
   log(`Regra: ${descreverRegra()}`);
 
@@ -100,7 +90,9 @@ export async function sincronizar({ simular = false, notion = criarClienteNotion
 
   // Leituras completas antes de qualquer gravação
   const titulos = await buscarTitulosVencidos();
-  log(`Sankhya: ${titulos.length} títulos na carteira`);
+  const porFaixa = {};
+  for (const t of titulos) porFaixa[faixa(t.DIAS_ATRASO)] = (porFaixa[faixa(t.DIAS_ATRASO)] ?? 0) + 1;
+  log(`Sankhya: ${titulos.length} títulos na carteira ${JSON.stringify(porFaixa)}`);
   const { porChave, duplicadas } = await listarPaginas(notion, base);
   log(`Notion: ${porChave.size + duplicadas.size} chaves de títulos na base`);
 
@@ -130,9 +122,9 @@ export async function sincronizar({ simular = false, notion = criarClienteNotion
 
   // Saídas: confere no Sankhya, pelo NUFIN, cada card que não veio na carteira
   const fora = [...porChave].filter(([chave]) => !naCarteira.has(chave));
-  const situacao = fora.length > 0 ? await consultarSituacao(fora.map(([, v]) => v.nufin)) : new Map();
+  const situacao = fora.length > 0 ? await consultarSituacao(fora.map(([, v]) => v.id)) : new Map();
   const remocoes = [];
-  for (const [chave, { nufin, pagina }] of fora) {
+  for (const [chave, { id: nufin, pagina }] of fora) {
     const decisao = classificarSaida(situacao.get(nufin));
     if (decisao.remover) remocoes.push({ chave, pagina, motivo: decisao.remover });
     else excecao(chave, `${decisao.manter}; card mantido`);
@@ -159,20 +151,13 @@ export async function sincronizar({ simular = false, notion = criarClienteNotion
       for (const item of lista.slice(0, 15)) log(`  ${descrever(item)}`);
     };
     exemplos('Seriam incluídos', novos, (t) =>
-      `${chaveDoTitulo(t)} | empresa ${t.CODEMP} | venc ${dataBR(t.DTVENC)} | ${t.DIAS_ATRASO} dias | ${brl(t.VLRDESDOB)} | ${t.DESCRTIPTIT ?? ''}`);
+      `${chaveDoTitulo(t)} | ${faixa(t.DIAS_ATRASO)} | empresa ${t.CODEMP} | venc ${dataBR(t.DTVENC)} | ${brl(t.VLRDESDOB)} | ${t.DESCRTIPTIT ?? ''}`);
     exemplos('Seriam removidos', remocoes, (r) => `${r.chave} | ${r.motivo}`);
 
     // Monta os cards sem gravar, para conferir as opções das colunas de seleção
     const cards = novos.map((t) => montarPropriedades(base, t));
-    if (cards[0]) {
-      log(`Exemplo de card (${chaveDoTitulo(novos[0])}):`);
-      for (const [coluna, v] of Object.entries(cards[0])) {
-        const valor = v.title?.[0]?.text.content ?? v.rich_text?.[0]?.text.content ?? v.select?.name ??
-          v.status?.name ?? v.date?.start ?? v.number ?? '(vazio)';
-        log(`  ${coluna.padEnd(28)} ${String(valor).slice(0, 90)}`);
-      }
-    }
-    log(`Planilha da conferência: ${await salvarPlanilhaConferencia(novos, remocoes, excecoes)}`);
+    if (cards[0]) mostrarCard(chaveDoTitulo(novos[0]), cards[0]);
+    log(`Planilha da conferência: ${await planilhaConferencia(novos, remocoes, excecoes)}`);
   } else {
     await emParalelo(novos, async (titulo) => {
       try {
@@ -206,3 +191,6 @@ export async function sincronizar({ simular = false, notion = criarClienteNotion
   log(`Resumo: ${JSON.stringify(resumo)}`);
   return resumo;
 }
+
+// Nome antigo, usado pelos testes
+export const sincronizar = sincronizarTitulos;

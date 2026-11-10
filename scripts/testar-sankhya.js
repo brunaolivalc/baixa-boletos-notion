@@ -32,6 +32,9 @@ for (const [empresa, { qtd, valor }] of [...porEmpresa].sort()) {
 }
 
 const faixas = [
+  ['a vencer', (d) => d < 0],
+  ['vence hoje', (d) => d === 0],
+  ['1 a 7 dias', (d) => d <= 7],
   ['8 a 30 dias', (d) => d <= 30],
   ['31 a 90 dias', (d) => d <= 90],
   ['91 a 365 dias', (d) => d <= 365],

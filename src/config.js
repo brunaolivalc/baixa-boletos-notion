@@ -41,6 +41,10 @@ export const config = {
   tiposTitulo: listaDeNumeros(process.env.TIPOS_TITULO),
   // Opcional: ignora estes tipos de título (CODTIPTIT)
   tiposTituloIgnorar: listaDeNumeros(process.env.TIPOS_TITULO_IGNORAR),
+  // Títulos a vencer: também carrega os que vencem nos próximos X dias (0 = não carrega)
+  diasAVencer: Number(process.env.DIAS_A_VENCER ?? 7),
+  // Sucata: entra o cliente devendo mais que X kg (0 = qualquer saldo negativo)
+  sucataSaldoMinimoKg: Number(process.env.SUCATA_SALDO_MINIMO_KG ?? 10),
   // Opcional: ignora estes parceiros (CODPARC), ex.: 4262 = REDECARD
   parceirosIgnorar: listaDeNumeros(process.env.PARCEIROS_IGNORAR ?? '4262'),
 };

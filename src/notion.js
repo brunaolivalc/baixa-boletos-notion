@@ -71,8 +71,9 @@ async function acharFonteDeDados(notion, id) {
 
 /**
  * Abre a base e confere quais colunas do de-para existem nela.
+ * `campos` = de-para da rotina (títulos por padrão, ou CAMPOS_SUCATA).
  */
-export async function abrirBase(notion) {
+export async function abrirBase(notion, campos = CAMPOS) {
   const fonte = await acharFonteDeDados(notion, extrairId(config.notion.base));
   const props = Object.values(fonte.properties);
   const porNome = new Map(props.map((p) => [normalizarNome(p.name), p]));
@@ -89,7 +90,7 @@ export async function abrirBase(notion) {
   const colunas = [];
   const avisos = [];
 
-  for (const campo of CAMPOS) {
+  for (const campo of campos) {
     let prop = campo.nomes.map(acharProp).find(Boolean);
     if (!prop && campo.titulo) prop = props.find((p) => p.type === 'title');
     if (!prop) {
@@ -115,9 +116,34 @@ export async function abrirBase(notion) {
     colunas,
     colunaChave,
     colunaVencimento: acharProp(COLUNA_VENCIMENTO),
+    acharProp,
     avisos,
     avisosDeOpcao: new Set(),
   };
+}
+
+/**
+ * Monta propriedades a partir de { nome da coluna: valor }, respeitando o tipo de cada coluna.
+ * Coluna que não existir na base é ignorada com aviso.
+ */
+export function propriedadesAvulsas(base, valores) {
+  const props = {};
+  for (const [nome, valor] of Object.entries(valores)) {
+    const prop = base.acharProp(nome);
+    if (!prop || !TIPOS_GRAVAVEIS.has(prop.type)) {
+      base.avisosDeOpcao.add(`Coluna "${nome}" não existe ou não pode ser preenchida (ignorada).`);
+      continue;
+    }
+    const v = paraNotion(base, prop, valor);
+    if (v !== undefined) props[prop.name] = v;
+  }
+  return props;
+}
+
+/** Valor simples de uma coluna de uma página (texto, número, data ou nome da opção). */
+export function valorDaColuna(base, pagina, nome) {
+  const prop = base.acharProp(nome);
+  return prop ? valorSimples(pagina.properties[prop.name]) : null;
 }
 
 // ---------- conversão de valores ----------
@@ -199,42 +225,47 @@ export function vencimentoNoNotion(base, pagina) {
 }
 
 /**
- * Todas as páginas de títulos da base, indexadas pela Chave Sankhya.
- * Só considera chaves "TIT:<número>"; cards de sucata e cards sem chave ficam de fora.
+ * Todas as páginas da base com chave "<prefixo><número>" (ex.: TIT:123, SUC:456),
+ * indexadas pela chave. Inclui as encerradas; só a lixeira fica de fora.
+ * Cards de outro tipo e cards sem chave são ignorados.
  */
-export async function listarPaginas(notion, base) {
+export async function listarPaginas(notion, base, prefixo = PREFIXO_CHAVE) {
   const paginas = await collectPaginatedAPI(notion.dataSources.query, {
     data_source_id: base.dataSourceId,
     page_size: 100,
   });
 
-  const porChave = new Map();
+  const porChave = new Map(); // chave -> { id, pagina }
   const duplicadas = new Map(); // chave -> lista de páginas
 
   for (const pagina of paginas) {
     if (pagina.object !== 'page' || pagina.in_trash) continue;
     const chave = valorSimples(pagina.properties[base.colunaChave.name])?.toUpperCase().replace(/\s+/g, '');
-    if (!chave?.startsWith(PREFIXO_CHAVE)) continue;
-    const nufin = Number(chave.slice(PREFIXO_CHAVE.length));
-    if (!Number.isInteger(nufin) || nufin <= 0) continue;
+    if (!chave?.startsWith(prefixo)) continue;
+    const id = Number(chave.slice(prefixo.length));
+    if (!Number.isInteger(id) || id <= 0) continue;
 
-    const normal = `${PREFIXO_CHAVE}${nufin}`;
+    const normal = `${prefixo}${id}`;
     if (duplicadas.has(normal)) duplicadas.get(normal).push(pagina);
     else if (porChave.has(normal)) {
-      duplicadas.set(normal, [porChave.get(normal), pagina]);
+      duplicadas.set(normal, [porChave.get(normal).pagina, pagina]);
       porChave.delete(normal);
-    } else porChave.set(normal, { nufin, pagina });
+    } else porChave.set(normal, { id, pagina });
   }
 
   return { porChave, duplicadas, total: paginas.length };
 }
 
-export function criarPagina(notion, base, titulo) {
+export function criarPagina(notion, base, item) {
   return notion.pages.create({
     parent: { type: 'data_source_id', data_source_id: base.dataSourceId },
-    properties: montarPropriedades(base, titulo),
+    properties: montarPropriedades(base, item),
     children: CORPO_CARD_NOVO,
   });
+}
+
+export function atualizarPagina(notion, pagina, propriedades) {
+  return notion.pages.update({ page_id: pagina.id, properties: propriedades });
 }
 
 /** Manda a página para a lixeira do Notion e confirma na resposta. */

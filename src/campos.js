@@ -74,6 +74,38 @@ export const CAMPOS = [
   { nomes: ['Assessoria'], valor: (t) => ASSESSORIAS[t.CODTIPTIT] ?? null },
 ];
 
+// ---------- Sucata ----------
+// O saldo oficial é por cliente (matriz + filiais), não por loja; por isso a chave é SUC:<CODPARC do grupo>.
+// A loja é a do movimento mais recente do cliente e serve só para apresentação.
+export const PREFIXO_SUCATA = 'SUC:';
+export const chaveDaSucata = (s) => `${PREFIXO_SUCATA}${s.CODPARC}`;
+
+export const CAMPOS_SUCATA = [
+  { nomes: ['Nome'], titulo: true, valor: (s) => texto(s.NOMEPARC) },
+  { nomes: ['Parceiro'], valor: (s) => texto(s.RAZAOSOCIAL) ?? texto(s.NOMEPARC) },
+  { nomes: [COLUNA_CHAVE], valor: chaveDaSucata },
+  { nomes: ['Tipo de pendência'], valor: () => 'Sucata' },
+  { nomes: ['Situação da pendência'], valor: () => 'Em aberto' },
+  { nomes: ['Andamento da cobrança'], valor: () => 'A tratar' },
+  { nomes: ['Loja'], valor: (s) => LOJAS[s.CODEMP] ?? null },
+  { nomes: ['Polo de alinhamento'], valor: (s) => POLOS[s.CODEMP] ?? null },
+  { nomes: ['Código da empresa'], valor: (s) => codigo(s.CODEMP) },
+  { nomes: ['Código do parceiro'], valor: (s) => codigo(s.CODPARC) },
+  { nomes: ['Localidade'], valor: (s) => texto(s.LOCALIDADE) },
+  { nomes: ['Saldo de sucata (kg)'], valor: (s) => s.SALDO_KG },
+  { nomes: ['Dias no negativo'], valor: (s) => s.DIAS_NEGATIVO },
+];
+
+// Colunas usadas para encerrar e reabrir pendências de sucata
+export const SUCATA_ENCERRAMENTO = {
+  situacao: 'Situação da pendência',
+  andamento: 'Andamento da cobrança',
+  motivo: 'Motivo do encerramento',
+  data: 'Data de encerramento',
+  saldo: 'Saldo de sucata (kg)',
+  dias: 'Dias no negativo',
+};
+
 // Conteúdo inicial do corpo de cada card novo
 export const CORPO_CARD_NOVO = [
   {
