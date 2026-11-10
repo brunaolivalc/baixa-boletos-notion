@@ -1,0 +1,19 @@
+{
+  "name": "baixa-boletos-notion",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sincroniza títulos a receber vencidos há 7+ dias do Sankhya com uma base do Notion (LC Baterias)",
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "conferir": "node src/index.js --simular",
+    "testar:sankhya": "node scripts/testar-sankhya.js",
+    "ver:notion": "node scripts/ver-notion.js"
+  },
+  "dependencies": {
+    "@notionhq/client": "5.28.0"
+  }
+}

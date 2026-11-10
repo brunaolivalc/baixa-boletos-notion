@@ -1,0 +1,5 @@
+[deploy]
+# Todo dia às 7h de Brasília (10:00 UTC)
+cronSchedule = "0 10 * * *"
+startCommand = "npm start"
+restartPolicyType = "NEVER"
