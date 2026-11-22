@@ -26,6 +26,7 @@ import {
   camposParaCompletar, clientesDaPagina, propriedadeCliente,
 } from './notion.js';
 import { abrirClientes, garantirClientes } from './clientes.js';
+import { buscarSucataDevendo } from './sucata.js';
 import { agora, hojeISO, log, dataBR, brl, emParalelo, salvarPlanilha } from './util.js';
 
 function descreverRegra() {
@@ -167,14 +168,18 @@ export async function sincronizarTitulos({ simular = false, notion = criarClient
     !/^\d+$/.test(String(valorDaColuna(base, pagina, COLUNA_PARCEIRO) ?? '')));
   const dados = precisa.length > 0 ? await buscarTitulosPorNufin(precisa.map((p) => p.id)) : new Map();
 
-  // Clientes: resolve todos antes de gravar qualquer pendência
+  // Clientes: resolve todos antes de gravar qualquer pendência. Quem também deve sucata já nasce
+  // com a visualização de sucata (se a consulta de sucata falhar, a rotina de sucata acrescenta depois)
   if (!clientes.aviso) {
+    const comSucata = new Set(await buscarSucataDevendo().then((l) => l.map((s) => s.CODPARC)).catch(() => []));
     const pedidos = [...novos, ...precisa.map((p) => dados.get(p.id)).filter(Boolean)]
-      .map((t) => ({ codigo: t.CODPARC, nome: t.NOMEPARC }));
+      .map((t) => ({ codigo: t.CODPARC, nome: t.NOMEPARC, sucata: comSucata.has(t.CODPARC) }));
     const r = await garantirClientes(notion, clientes, pedidos, { simular });
     log(`Clientes: ${r.faltavam} a criar${simular ? '' : ` | criados ${r.criados} | erros ${r.erros}`}`);
   }
-  const vinculo = (codparc) => (clientes.aviso ? {} : propriedadeCliente(base, clientes.porCodigo.get(String(codparc))));
+  // Na conferência os clientes novos não são criados: conta o vínculo como se fossem
+  const vinculo = (codparc) => (clientes.aviso ? {}
+    : propriedadeCliente(base, clientes.porCodigo.get(String(codparc)) ?? (simular ? '(cliente novo)' : null)));
 
   const completar = [];
   const contagem = {};

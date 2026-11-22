@@ -92,14 +92,22 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
   }
   const jaExistentes = abertosNaLista.length + abertosFora.length;
 
-  // Clientes: resolve todos antes de gravar
+  // Clientes: resolve todos antes de gravar. Quem tem sucata nova, reaberta ou vinculada agora
+  // ganha também a visualização de sucata na página do cliente
   if (!clientes.aviso) {
-    const pedidos = [...novos, ...reaberturas.map((r) => r.sucata), ...abertosNaLista.map((a) => a.sucata), ...abertosFora.map((a) => a.sucata)]
-      .map((s) => ({ codigo: s.CODPARC, nome: s.NOMEPARC }));
-    const r = await garantirClientes(notion, clientes, pedidos, { simular });
-    log(`Clientes: ${r.faltavam} a criar${simular ? '' : ` | criados ${r.criados} | erros ${r.erros}`}`);
+    const semVinculo = [...abertosNaLista, ...abertosFora].filter((a) => clientesDaPagina(base, a.pagina).length === 0);
+    const comSucataNova = [...novos, ...reaberturas.map((r) => r.sucata), ...semVinculo.map((a) => a.sucata)];
+    const pedidos = [...comSucataNova, ...abertosNaLista.map((a) => a.sucata), ...abertosFora.map((a) => a.sucata)]
+      .map((s) => ({ codigo: s.CODPARC, nome: s.NOMEPARC, sucata: true }));
+    const r = await garantirClientes(notion, clientes, pedidos, {
+      simular,
+      sucataGarantir: comSucataNova.map((s) => s.CODPARC),
+    });
+    log(`Clientes: ${r.faltavam} a criar${simular ? '' : ` | criados ${r.criados} | visualizações de sucata acrescentadas ${r.visoesSucata} | erros ${r.erros}`}`);
   }
-  const vinculo = (codparc) => (clientes.aviso ? {} : propriedadeCliente(base, clientes.porCodigo.get(String(codparc))));
+  // Na conferência os clientes novos não são criados: conta o vínculo como se fossem
+  const vinculo = (codparc) => (clientes.aviso ? {}
+    : propriedadeCliente(base, clientes.porCodigo.get(String(codparc)) ?? (simular ? '(cliente novo)' : null)));
 
   // Completar cards abertos: vínculo com cliente e campos do Sankhya vazios
   const completar = [];
