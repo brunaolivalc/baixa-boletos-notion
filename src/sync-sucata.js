@@ -84,37 +84,67 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
   const saldos = fora.length > 0 ? await consultarSaldosSucata(fora.map(([, v]) => v.id)) : new Map();
   const encerramentos = [];
   const abertosFora = [];
+  const semMovimento = [];
   for (const [chave, { id, pagina }] of fora) {
     const s = saldos.get(id);
-    if (!s) excecao(chave, 'cliente sem movimento de sucata no Sankhya; card mantido');
-    else if (s.SALDO_KG >= 0) encerramentos.push({ chave, pagina, motivo: `sucata regularizada (saldo atual ${kg(s.SALDO_KG)})` });
+    if (!s) {
+      excecao(chave, 'cliente sem movimento de sucata no Sankhya; card mantido');
+      semMovimento.push({ chave, id, pagina, sucata: null });
+    } else if (s.SALDO_KG >= 0) encerramentos.push({ chave, pagina, motivo: `sucata regularizada (saldo atual ${kg(s.SALDO_KG)})` });
     else abertosFora.push({ chave, id, pagina, sucata: s }); // ainda devendo, abaixo do limite ou em outra loja
   }
   const jaExistentes = abertosNaLista.length + abertosFora.length;
 
+  // O cliente da pendência é o do campo Parceiro do card; sem ele, o código da chave SUC:<CODPARC>
+  const codigoDoCard = (pagina) => {
+    const c = String(valorDaColuna(base, pagina, COLUNA_PARCEIRO) ?? '').trim();
+    return /^\d+$/.test(c) ? c : null;
+  };
+  const codigoCliente = ({ id, pagina }) => codigoDoCard(pagina) ?? String(id);
+  const nomeCliente = ({ pagina, sucata }) => valorDaColuna(base, pagina, 'Nome') ?? sucata?.NOMEPARC;
+  const abertosTodos = [...abertosNaLista, ...abertosFora, ...semMovimento];
+
+  // Vínculo com cliente de outro código: conflito para revisão (não troca sozinho)
+  if (!clientes.aviso) {
+    for (const { chave, pagina } of abertosTodos) {
+      const ids = clientesDaPagina(base, pagina);
+      if (ids.length > 1) excecao(chave, `ligado a ${ids.length} clientes; cada pendência deve ter um só`);
+      else if (ids.length === 1) {
+        const vinculado = clientes.codigoDaPagina(ids[0]);
+        const doCard = codigoDoCard(pagina);
+        if (vinculado && doCard && vinculado !== doCard) {
+          excecao(chave, `vinculado ao cliente ${vinculado}, mas o Parceiro do card é ${doCard}`);
+        }
+      }
+    }
+  }
+
   // Clientes: resolve todos antes de gravar. Quem tem sucata nova, reaberta ou vinculada agora
   // ganha também a visualização de sucata na página do cliente
+  const semVinculo = clientes.aviso ? [] : abertosTodos.filter((a) => clientesDaPagina(base, a.pagina).length === 0);
   if (!clientes.aviso) {
-    const semVinculo = [...abertosNaLista, ...abertosFora].filter((a) => clientesDaPagina(base, a.pagina).length === 0);
-    const comSucataNova = [...novos, ...reaberturas.map((r) => r.sucata), ...semVinculo.map((a) => a.sucata)];
-    const pedidos = [...comSucataNova, ...abertosNaLista.map((a) => a.sucata), ...abertosFora.map((a) => a.sucata)]
-      .map((s) => ({ codigo: s.CODPARC, nome: s.NOMEPARC, sucata: true }));
+    const pedidos = [
+      ...novos.map((s) => ({ codigo: String(s.CODPARC), nome: s.NOMEPARC })),
+      ...reaberturas.map((r) => ({ codigo: codigoCliente({ id: r.sucata.CODPARC, pagina: r.pagina }), nome: r.sucata.NOMEPARC })),
+      ...semVinculo.map((a) => ({ codigo: codigoCliente(a), nome: nomeCliente(a) })),
+    ].filter((p) => p.codigo).map((p) => ({ ...p, sucata: true }));
     const r = await garantirClientes(notion, clientes, pedidos, {
       simular,
-      sucataGarantir: comSucataNova.map((s) => s.CODPARC),
+      sucataGarantir: pedidos.map((p) => p.codigo),
     });
     log(`Clientes: ${r.faltavam} a criar${simular ? '' : ` | criados ${r.criados} | visualizações de sucata acrescentadas ${r.visoesSucata} | erros ${r.erros}`}`);
   }
   // Na conferência os clientes novos não são criados: conta o vínculo como se fossem
-  const vinculo = (codparc) => (clientes.aviso ? {}
+  const vinculo = (codparc) => (clientes.aviso || !codparc ? {}
     : propriedadeCliente(base, clientes.porCodigo.get(String(codparc)) ?? (simular ? '(cliente novo)' : null)));
 
   // Completar cards abertos: vínculo com cliente e campos do Sankhya vazios
   const completar = [];
-  for (const { chave, pagina, sucata } of [...abertosNaLista, ...abertosFora]) {
-    const props = camposParaCompletar(base, pagina, sucata, CAMPOS_DO_ERP_SUCATA, COLUNA_PARCEIRO);
-    if (!clientes.aviso && clientesDaPagina(base, pagina).length === 0) Object.assign(props, vinculo(sucata.CODPARC));
-    if (Object.keys(props).length > 0) completar.push({ chave, pagina, props });
+  const semVinculoIds = new Set(semVinculo.map((a) => a.id));
+  for (const a of abertosTodos) {
+    const props = a.sucata ? camposParaCompletar(base, a.pagina, a.sucata, CAMPOS_DO_ERP_SUCATA, COLUNA_PARCEIRO) : {};
+    if (semVinculoIds.has(a.id)) Object.assign(props, vinculo(codigoCliente(a)));
+    if (Object.keys(props).length > 0) completar.push({ chave: a.chave, pagina: a.pagina, props });
   }
 
   log(`Plano: incluir ${novos.length} | já existentes ${jaExistentes} | completar ${completar.length} | ` +

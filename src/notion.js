@@ -319,13 +319,31 @@ export function criarPagina(notion, base, item, propriedadesExtras = {}) {
   });
 }
 
+/**
+ * Repete uma operação que pode ser repetida sem efeito colateral (atualizar campos, mandar para a
+ * lixeira) quando a rede falha. Criação de página NÃO passa por aqui: antes de recriar, a rotina
+ * consulta a chave de novo na próxima execução.
+ */
+async function comNovaTentativa(operacao, tentativas = 3) {
+  for (let i = 1; ; i++) {
+    try {
+      return await operacao();
+    } catch (erro) {
+      const deRede = /fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket|network|timed out/i.test(String(erro.message))
+        || erro.code === 'notionhq_client_request_timeout';
+      if (!deRede || i >= tentativas) throw erro;
+      await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+}
+
 export function atualizarPagina(notion, pagina, propriedades) {
-  return notion.pages.update({ page_id: pagina.id, properties: propriedades });
+  return comNovaTentativa(() => notion.pages.update({ page_id: pagina.id, properties: propriedades }));
 }
 
 /** Manda a página para a lixeira do Notion e confirma na resposta. */
 export async function excluirPagina(notion, pagina) {
-  const resposta = await notion.pages.update({ page_id: pagina.id, in_trash: true });
+  const resposta = await comNovaTentativa(() => notion.pages.update({ page_id: pagina.id, in_trash: true }));
   if (resposta.in_trash !== true) throw new Error('o Notion não confirmou o envio para a lixeira');
   return resposta;
 }

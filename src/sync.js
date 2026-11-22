@@ -162,35 +162,61 @@ export async function sincronizarTitulos({ simular = false, notion = criarClient
 
   // Completar cards que ficam: vínculo com cliente, vendedor e campos do Sankhya vazios
   const ficam = [...existentes, ...mantidosFora];
-  const precisa = ficam.filter(({ pagina }) =>
-    (!clientes.aviso && clientesDaPagina(base, pagina).length === 0) ||
-    CAMPOS_DO_ERP_TITULO.some((nome) => valorDaColuna(base, pagina, nome) == null) ||
-    !/^\d+$/.test(String(valorDaColuna(base, pagina, COLUNA_PARCEIRO) ?? '')));
-  const dados = precisa.length > 0 ? await buscarTitulosPorNufin(precisa.map((p) => p.id)) : new Map();
+  const codigoDoCard = (pagina) => {
+    const c = String(valorDaColuna(base, pagina, COLUNA_PARCEIRO) ?? '').trim();
+    return /^\d+$/.test(c) ? c : null;
+  };
+  const erpIncompleto = ficam.filter(({ pagina }) =>
+    CAMPOS_DO_ERP_TITULO.some((nome) => valorDaColuna(base, pagina, nome) == null) || !codigoDoCard(pagina));
+  const semVinculo = clientes.aviso ? [] : ficam.filter(({ pagina }) => clientesDaPagina(base, pagina).length === 0);
+  const paraBuscar = [...new Set([...erpIncompleto, ...semVinculo].map((p) => p.id))];
+  const dados = paraBuscar.length > 0 ? await buscarTitulosPorNufin(paraBuscar) : new Map();
+
+  // O cliente da pendência é o do campo Parceiro do card (o Sankhya pode trocar o parceiro do título
+  // depois, ex.: garantia que vira despesa de outro parceiro); sem ele, o parceiro atual do Sankhya
+  const codigoCliente = ({ id, pagina }) => codigoDoCard(pagina) ?? (dados.get(id) ? String(dados.get(id).CODPARC) : null);
+  const nomeCliente = ({ id, pagina }) => valorDaColuna(base, pagina, 'Nome') ?? dados.get(id)?.NOMEPARC;
+
+  // Vínculo com cliente de outro código: conflito para revisão (não troca sozinho)
+  if (!clientes.aviso) {
+    for (const { chave, pagina } of ficam) {
+      const ids = clientesDaPagina(base, pagina);
+      if (ids.length > 1) excecao(chave, `ligado a ${ids.length} clientes; cada pendência deve ter um só`);
+      else if (ids.length === 1) {
+        const vinculado = clientes.codigoDaPagina(ids[0]);
+        const doCard = codigoDoCard(pagina);
+        if (vinculado && doCard && vinculado !== doCard) {
+          excecao(chave, `vinculado ao cliente ${vinculado}, mas o Parceiro do card é ${doCard}`);
+        }
+      }
+    }
+  }
 
   // Clientes: resolve todos antes de gravar qualquer pendência. Quem também deve sucata já nasce
   // com a visualização de sucata (se a consulta de sucata falhar, a rotina de sucata acrescenta depois)
   if (!clientes.aviso) {
-    const comSucata = new Set(await buscarSucataDevendo().then((l) => l.map((s) => s.CODPARC)).catch(() => []));
-    const pedidos = [...novos, ...precisa.map((p) => dados.get(p.id)).filter(Boolean)]
-      .map((t) => ({ codigo: t.CODPARC, nome: t.NOMEPARC, sucata: comSucata.has(t.CODPARC) }));
+    const comSucata = new Set(await buscarSucataDevendo().then((l) => l.map((s) => String(s.CODPARC))).catch(() => []));
+    const pedidos = [
+      ...novos.map((t) => ({ codigo: String(t.CODPARC), nome: t.NOMEPARC })),
+      ...semVinculo.map((c) => ({ codigo: codigoCliente(c), nome: nomeCliente(c) })),
+    ].filter((p) => p.codigo).map((p) => ({ ...p, sucata: comSucata.has(p.codigo) }));
     const r = await garantirClientes(notion, clientes, pedidos, { simular });
     log(`Clientes: ${r.faltavam} a criar${simular ? '' : ` | criados ${r.criados} | erros ${r.erros}`}`);
   }
   // Na conferência os clientes novos não são criados: conta o vínculo como se fossem
-  const vinculo = (codparc) => (clientes.aviso ? {}
+  const vinculo = (codparc) => (clientes.aviso || !codparc ? {}
     : propriedadeCliente(base, clientes.porCodigo.get(String(codparc)) ?? (simular ? '(cliente novo)' : null)));
 
   const completar = [];
   const contagem = {};
-  for (const { chave, id, pagina } of precisa) {
-    const titulo = dados.get(id);
-    if (!titulo) continue;
-    const props = camposParaCompletar(base, pagina, titulo, CAMPOS_DO_ERP_TITULO, COLUNA_PARCEIRO);
-    if (!clientes.aviso && clientesDaPagina(base, pagina).length === 0) Object.assign(props, vinculo(titulo.CODPARC));
+  const semVinculoIds = new Set(semVinculo.map((c) => c.id));
+  for (const c of [...new Map([...erpIncompleto, ...semVinculo].map((x) => [x.id, x])).values()]) {
+    const titulo = dados.get(c.id);
+    const props = titulo ? camposParaCompletar(base, c.pagina, titulo, CAMPOS_DO_ERP_TITULO, COLUNA_PARCEIRO) : {};
+    if (semVinculoIds.has(c.id)) Object.assign(props, vinculo(codigoCliente(c)));
     if (Object.keys(props).length === 0) continue;
     for (const nome of Object.keys(props)) contagem[nome] = (contagem[nome] ?? 0) + 1;
-    completar.push({ chave, pagina, props });
+    completar.push({ chave: c.chave, pagina: c.pagina, props });
   }
 
   const semVendedor = novos.filter((t) => !t.VENDEDOR);

@@ -75,6 +75,7 @@ export async function abrirClientes(notion, base) {
     colunaTitulo,
     colunaCodigo,
     porCodigo,
+    codigoDaPagina: (id) => [...porCodigo].find(([, pid]) => semHifen(pid) === semHifen(id))?.[0] ?? null,
     conflitos: [...new Set(conflitos)],
     principal: base, // schema da base principal (IDs das colunas para a visão de sucata)
     modelos: null, // visualizações do cliente-modelo, carregadas sob demanda
