@@ -29,20 +29,19 @@ export const config = {
   },
   notion: {
     get token() { return obrigatoria('NOTION_TOKEN'); },
+    // Fonte de dados da base "Posição de Cobrança" (títulos e sucata)
     get base() { return obrigatoria('NOTION_DATABASE'); },
+    // Fonte de dados da base por cliente (seção 7 do roteiro)
+    clientes: process.env.NOTION_CLIENTES?.trim() || '41f9fe7c-432e-81bf-90e3-000ba27aa0e8',
   },
   // Empresas do Sankhya que entram na sincronização
   empresas: listaDeNumeros(process.env.EMPRESAS || '1,2,3,4,5,6,7,8,9'),
-  // Entra no Notion o título vencido há MAIS de X dias (com 7, entra a partir do 8º dia)
-  diasAtraso: Number(process.env.DIAS_ATRASO || 7),
-  // Opcional: não traz títulos vencidos há mais de X dias (vazio = sem limite)
+  // Títulos: entra tudo que venceu até ontem. Opcional: não traz títulos vencidos há mais de X dias
   diasAtrasoMaximo: process.env.DIAS_ATRASO_MAXIMO ? Number(process.env.DIAS_ATRASO_MAXIMO) : null,
   // Opcional: só estes tipos de título (CODTIPTIT). Vazio = todos
   tiposTitulo: listaDeNumeros(process.env.TIPOS_TITULO),
   // Opcional: ignora estes tipos de título (CODTIPTIT)
   tiposTituloIgnorar: listaDeNumeros(process.env.TIPOS_TITULO_IGNORAR),
-  // Títulos a vencer: também carrega os que vencem nos próximos X dias (0 = não carrega)
-  diasAVencer: Number(process.env.DIAS_A_VENCER ?? 7),
   // Sucata: entra o cliente devendo mais que X kg (0 = qualquer saldo negativo)
   sucataSaldoMinimoKg: Number(process.env.SUCATA_SALDO_MINIMO_KG ?? 10),
   // Opcional: ignora estes parceiros (CODPARC), ex.: 4262 = REDECARD

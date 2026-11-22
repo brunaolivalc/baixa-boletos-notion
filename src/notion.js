@@ -3,7 +3,7 @@
  */
 import { Client, collectPaginatedAPI } from '@notionhq/client';
 import { config } from './config.js';
-import { CAMPOS, COLUNA_CHAVE, PREFIXO_CHAVE, COLUNA_VENCIMENTO, CORPO_CARD_NOVO } from './campos.js';
+import { CAMPOS, COLUNA_CHAVE, PREFIXO_CHAVE, COLUNA_VENCIMENTO, COLUNA_CLIENTE, CORPO_CARD_NOVO } from './campos.js';
 
 const TIPOS_GRAVAVEIS = new Set([
   'title', 'rich_text', 'number', 'date', 'select', 'multi_select',
@@ -89,17 +89,28 @@ export async function abrirBase(notion, campos = CAMPOS) {
 
   const colunas = [];
   const avisos = [];
+  const faltando = [];
 
   for (const campo of campos) {
     let prop = campo.nomes.map(acharProp).find(Boolean);
     if (!prop && campo.titulo) prop = props.find((p) => p.type === 'title');
     if (!prop) {
-      avisos.push(`Coluna "${campo.nomes[0]}" não existe no Notion (ignorada).`);
+      if (campo.opcional) avisos.push(`Coluna "${campo.nomes[0]}" não existe no Notion (ignorada).`);
+      else faltando.push(campo.nomes[0]);
     } else if (!TIPOS_GRAVAVEIS.has(prop.type)) {
-      avisos.push(`Coluna "${prop.name}" é do tipo ${prop.type}, que não dá para preencher pela API (ignorada).`);
+      if (campo.opcional) avisos.push(`Coluna "${prop.name}" é do tipo ${prop.type} e não dá para preencher (ignorada).`);
+      else faltando.push(`${prop.name} (tipo ${prop.type} não aceita gravação)`);
     } else {
-      colunas.push({ prop, valorDoTitulo: campo.valor });
+      colunas.push({ prop, nomeLogico: campo.nomes[0], valorDoTitulo: campo.valor });
     }
+  }
+
+  // Coluna renomeada ou apagada: para tudo antes de gravar, para não criar cards incompletos
+  if (faltando.length > 0) {
+    throw new Error(
+      `Colunas não encontradas na base do Notion: ${faltando.join(', ')}. ` +
+      'Alguém renomeou ou apagou? Ajuste o nome no Notion ou em src/campos.js. Nada foi gravado.'
+    );
   }
 
   const colunaChave = acharProp(COLUNA_CHAVE);
@@ -107,6 +118,10 @@ export async function abrirBase(notion, campos = CAMPOS) {
   if (!['rich_text', 'title'].includes(colunaChave.type)) {
     throw new Error(`A coluna "${COLUNA_CHAVE}" precisa ser de texto (hoje é ${colunaChave.type}).`);
   }
+
+  // A relação "Cliente" só aparece para a integração quando a base de clientes também está conectada
+  const cliente = acharProp(COLUNA_CLIENTE);
+  const colunaCliente = cliente?.type === 'relation' ? cliente : null;
 
   return {
     nome: fonte.title?.map((t) => t.plain_text).join('') || '(sem nome)',
@@ -116,10 +131,23 @@ export async function abrirBase(notion, campos = CAMPOS) {
     colunas,
     colunaChave,
     colunaVencimento: acharProp(COLUNA_VENCIMENTO),
+    colunaCliente,
     acharProp,
     avisos,
     avisosDeOpcao: new Set(),
   };
+}
+
+/** IDs das páginas ligadas na relação "Cliente" de uma pendência. */
+export function clientesDaPagina(base, pagina) {
+  if (!base.colunaCliente) return [];
+  return (pagina.properties[base.colunaCliente.name]?.relation ?? []).map((r) => r.id);
+}
+
+/** Propriedade da relação "Cliente" apontando para uma página de cliente. */
+export function propriedadeCliente(base, paginaClienteId) {
+  if (!base.colunaCliente || !paginaClienteId) return {};
+  return { [base.colunaCliente.name]: { relation: [{ id: paginaClienteId }] } };
 }
 
 /**
@@ -198,7 +226,8 @@ function valorSimples(prop) {
   switch (prop.type) {
     case 'title':
     case 'rich_text':
-      return (prop[prop.type] ?? []).map((r) => r.plain_text ?? '').join('').trim() || null;
+      // plain_text quando vem do Notion; text.content quando é um valor montado para enviar
+      return (prop[prop.type] ?? []).map((r) => r.plain_text ?? r.text?.content ?? '').join('').trim() || null;
     case 'number':
       return prop.number ?? null;
     case 'date':
@@ -222,6 +251,32 @@ export function montarPropriedades(base, titulo) {
 
 export function vencimentoNoNotion(base, pagina) {
   return base.colunaVencimento ? valorSimples(pagina.properties[base.colunaVencimento.name]) : null;
+}
+
+/**
+ * Campos do Sankhya que estão VAZIOS no card e têm valor na origem. Nunca sobrescreve o que já
+ * está preenchido, com uma exceção: o código em "Parceiro" quando ali estiver outra coisa
+ * (cards criados enquanto a coluna tinha outro uso).
+ */
+export function camposParaCompletar(base, pagina, item, nomesDoErp, colunaCodigo) {
+  const props = {};
+  const nomes = new Set(nomesDoErp);
+  // Loja, Empresa e Polo andam juntos: se o card já tem Loja, Empresa e Polo seguem o código dessa
+  // Loja (ex.: "5 — Salvador"), e não a loja atual do Sankhya, para não misturar lojas no mesmo card
+  const GRUPO_LOJA = new Set(['Loja', 'Empresa', 'Polo de alinhamento']);
+  const loja = base.colunas.find((c) => c.nomeLogico === 'Loja');
+  const codigoDaLoja = loja ? parseInt(String(valorSimples(pagina.properties[loja.prop.name]) ?? ''), 10) : NaN;
+  const itemDaLoja = Number.isInteger(codigoDaLoja) ? { ...item, CODEMP: codigoDaLoja } : item;
+
+  for (const { prop, nomeLogico, valorDoTitulo } of base.colunas) {
+    if (!nomes.has(nomeLogico)) continue;
+    const novo = paraNotion(base, prop, valorDoTitulo(GRUPO_LOJA.has(nomeLogico) ? itemDaLoja : item));
+    if (novo === undefined || valorSimples({ type: prop.type, ...novo }) == null) continue;
+    const atual = valorSimples(pagina.properties[prop.name]);
+    const codigoErrado = nomeLogico === colunaCodigo && atual != null && !/^\d+$/.test(String(atual));
+    if (atual == null || codigoErrado) props[prop.name] = novo;
+  }
+  return props;
 }
 
 /**
@@ -256,10 +311,10 @@ export async function listarPaginas(notion, base, prefixo = PREFIXO_CHAVE) {
   return { porChave, duplicadas, total: paginas.length };
 }
 
-export function criarPagina(notion, base, item) {
+export function criarPagina(notion, base, item, propriedadesExtras = {}) {
   return notion.pages.create({
     parent: { type: 'data_source_id', data_source_id: base.dataSourceId },
-    properties: montarPropriedades(base, item),
+    properties: { ...montarPropriedades(base, item), ...propriedadesExtras },
     children: CORPO_CARD_NOVO,
   });
 }

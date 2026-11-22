@@ -11,8 +11,8 @@ const inicio = Date.now();
 const titulos = await buscarTitulosVencidos();
 const segundos = ((Date.now() - inicio) / 1000).toFixed(1);
 
-console.log(`Regra: empresas ${config.empresas.join(',')} | a receber | em aberto | vencidos há mais de ${config.diasAtraso} dias` +
-  (config.diasAtrasoMaximo != null ? ` e no máximo ${config.diasAtrasoMaximo}` : '') +
+console.log(`Regra: empresas ${config.empresas.join(',')} | a receber | em aberto | cliente externo | vencimento até ontem` +
+  (config.diasAtrasoMaximo != null ? ` e no máximo ${config.diasAtrasoMaximo} dias` : '') +
   (config.tiposTitulo.length ? ` | só tipos ${config.tiposTitulo.join(',')}` : '') +
   (config.tiposTituloIgnorar.length ? ` | sem os tipos ${config.tiposTituloIgnorar.join(',')}` : ''));
 console.log(`Títulos encontrados: ${titulos.length} (consulta levou ${segundos}s)`);

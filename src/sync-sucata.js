@@ -4,8 +4,9 @@
  * 1. Calcula no Sankhya o saldo de sucata de todos os clientes (SQL oficial SALDO_SUCATA_GRUPO).
  *    Entra quem deve mais que SUCATA_SALDO_MINIMO_KG, é cliente externo e cuja loja é de 1 a 9.
  * 2. Lê todos os cards de sucata do Notion, inclusive os encerrados (Chave Sankhya = SUC:<CODPARC>).
- * 3. Chave nova -> cria o card (Em aberto / A tratar + cabeçalho "Histórico de tratativas").
- *    Card em aberto -> não altera nada (fotografia da inclusão).
+ * 3. Chave nova -> garante o cliente e cria o card já com o vínculo (Em aberto / A tratar +
+ *    cabeçalho "Histórico de tratativas").
+ *    Card em aberto -> não altera nada (fotografia da inclusão); só completa o que estiver vazio.
  *    Card encerrado que voltou a dever -> reabre a mesma página com o novo saldo.
  * 4. Card em aberto cujo cliente saiu da lista -> confere o saldo no Sankhya:
  *    - saldo zerado ou positivo: Encerrada / Sucata regularizada / data de hoje (vai para o Histórico);
@@ -13,12 +14,16 @@
  *    - sem movimento de sucata: mantém e registra exceção.
  */
 import { config } from './config.js';
-import { CAMPOS_SUCATA, PREFIXO_SUCATA, chaveDaSucata, SUCATA_ENCERRAMENTO as COL, LOJAS, POLOS } from './campos.js';
+import {
+  CAMPOS_SUCATA, CAMPOS_DO_ERP_SUCATA, PREFIXO_SUCATA, chaveDaSucata, COLUNA_PARCEIRO,
+  SUCATA_ENCERRAMENTO as COL, LOJAS, POLOS,
+} from './campos.js';
 import { buscarSucataDevendo, consultarSaldosSucata } from './sucata.js';
 import {
-  criarClienteNotion, abrirBase, listarPaginas, montarPropriedades,
-  criarPagina, atualizarPagina, propriedadesAvulsas, valorDaColuna,
+  criarClienteNotion, abrirBase, listarPaginas, montarPropriedades, valorDaColuna,
+  criarPagina, atualizarPagina, propriedadesAvulsas, camposParaCompletar, clientesDaPagina, propriedadeCliente,
 } from './notion.js';
+import { abrirClientes, garantirClientes } from './clientes.js';
 import { agora, hojeISO, log, kg, emParalelo, salvarPlanilha } from './util.js';
 import { mostrarCard } from './sync.js';
 
@@ -26,8 +31,8 @@ const ENCERRADA = 'encerrada';
 const normal = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
 
 function planilhaConferencia(novos, reaberturas, encerramentos, excecoes) {
-  const linhas = [['Ação', 'Chave Sankhya', 'Código da empresa', 'Loja', 'Polo', 'Cliente', 'Código do parceiro',
-    'Localidade', 'Saldo de sucata (kg)', 'Dias no negativo', 'Motivo']];
+  const linhas = [['Ação', 'Chave Sankhya', 'Empresa', 'Loja', 'Polo', 'Cliente', 'Parceiro',
+    'Localidade', 'Saldo Sucata', 'Dias no negativo', 'Motivo']];
   const linha = (acao, s, motivo = '') => [acao, chaveDaSucata(s), s.CODEMP, LOJAS[s.CODEMP] ?? '', POLOS[s.CODEMP] ?? '',
     s.NOMEPARC, s.CODPARC, s.LOCALIDADE, s.SALDO_KG, s.DIAS_NEGATIVO, motivo];
   for (const s of novos) linhas.push(linha('Incluir', s));
@@ -44,6 +49,8 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
   const base = await abrirBase(notion, CAMPOS_SUCATA);
   log(`Notion: "${base.nome}" | ${base.colunas.length} colunas preenchidas na inclusão`);
   for (const aviso of base.avisos) log(`  aviso: ${aviso}`);
+  const clientes = await abrirClientes(notion, base);
+  if (clientes.aviso) log(`  aviso: vínculo com clientes desligado: ${clientes.aviso}`);
 
   // Leituras completas antes de qualquer gravação
   const devendo = await buscarSucataDevendo();
@@ -63,28 +70,47 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
   const naLista = new Map(devendo.map((s) => [chaveDaSucata(s), s]));
   const novos = [];
   const reaberturas = [];
-  let jaExistentes = 0;
+  const abertosNaLista = [];
   for (const [chave, sucata] of naLista) {
     if (duplicadas.has(chave)) continue;
     const existente = porChave.get(chave);
     if (!existente) novos.push(sucata);
     else if (situacao(existente.pagina) === ENCERRADA) reaberturas.push({ chave, pagina: existente.pagina, sucata });
-    else jaExistentes++;
+    else abertosNaLista.push({ chave, ...existente, sucata });
   }
 
   // Encerramentos: confere no Sankhya o saldo de cada card em aberto que saiu da lista
   const fora = [...porChave].filter(([chave, v]) => !naLista.has(chave) && situacao(v.pagina) !== ENCERRADA);
   const saldos = fora.length > 0 ? await consultarSaldosSucata(fora.map(([, v]) => v.id)) : new Map();
   const encerramentos = [];
+  const abertosFora = [];
   for (const [chave, { id, pagina }] of fora) {
     const s = saldos.get(id);
     if (!s) excecao(chave, 'cliente sem movimento de sucata no Sankhya; card mantido');
     else if (s.SALDO_KG >= 0) encerramentos.push({ chave, pagina, motivo: `sucata regularizada (saldo atual ${kg(s.SALDO_KG)})` });
-    else jaExistentes++; // ainda devendo, só abaixo do limite ou em outra loja: segue em aberto
+    else abertosFora.push({ chave, id, pagina, sucata: s }); // ainda devendo, abaixo do limite ou em outra loja
+  }
+  const jaExistentes = abertosNaLista.length + abertosFora.length;
+
+  // Clientes: resolve todos antes de gravar
+  if (!clientes.aviso) {
+    const pedidos = [...novos, ...reaberturas.map((r) => r.sucata), ...abertosNaLista.map((a) => a.sucata), ...abertosFora.map((a) => a.sucata)]
+      .map((s) => ({ codigo: s.CODPARC, nome: s.NOMEPARC }));
+    const r = await garantirClientes(notion, clientes, pedidos, { simular });
+    log(`Clientes: ${r.faltavam} a criar${simular ? '' : ` | criados ${r.criados} | erros ${r.erros}`}`);
+  }
+  const vinculo = (codparc) => (clientes.aviso ? {} : propriedadeCliente(base, clientes.porCodigo.get(String(codparc))));
+
+  // Completar cards abertos: vínculo com cliente e campos do Sankhya vazios
+  const completar = [];
+  for (const { chave, pagina, sucata } of [...abertosNaLista, ...abertosFora]) {
+    const props = camposParaCompletar(base, pagina, sucata, CAMPOS_DO_ERP_SUCATA, COLUNA_PARCEIRO);
+    if (!clientes.aviso && clientesDaPagina(base, pagina).length === 0) Object.assign(props, vinculo(sucata.CODPARC));
+    if (Object.keys(props).length > 0) completar.push({ chave, pagina, props });
   }
 
-  log(`Plano: incluir ${novos.length} | já existentes ${jaExistentes} | reabrir ${reaberturas.length} | ` +
-    `encerrar ${encerramentos.length} | exceções ${excecoes.length}`);
+  log(`Plano: incluir ${novos.length} | já existentes ${jaExistentes} | completar ${completar.length} | ` +
+    `reabrir ${reaberturas.length} | encerrar ${encerramentos.length} | exceções ${excecoes.length}`);
 
   const resumo = {
     horario: agora(),
@@ -93,6 +119,7 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
     consultados: devendo.length,
     incluidos: 0,
     jaExistentes,
+    completados: 0,
     reabertos: 0,
     encerrados: 0,
     excecoes: excecoes.length,
@@ -104,13 +131,16 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
     [COL.motivo]: 'Sucata regularizada',
     [COL.data]: hojeISO(),
   });
-  const propsReabrir = (s) => propriedadesAvulsas(base, {
-    [COL.situacao]: 'Em aberto',
-    [COL.andamento]: 'A tratar',
-    [COL.motivo]: null,
-    [COL.data]: null,
-    [COL.saldo]: s.SALDO_KG,
-    [COL.dias]: s.DIAS_NEGATIVO,
+  const propsReabrir = (pagina, s) => ({
+    ...propriedadesAvulsas(base, {
+      [COL.situacao]: 'Em aberto',
+      [COL.andamento]: 'A tratar',
+      [COL.motivo]: null,
+      [COL.data]: null,
+      [COL.saldo]: s.SALDO_KG,
+      [COL.dias]: s.DIAS_NEGATIVO,
+    }),
+    ...(!clientes.aviso && clientesDaPagina(base, pagina).length === 0 ? vinculo(s.CODPARC) : {}),
   });
 
   if (simular) {
@@ -121,6 +151,7 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
     };
     exemplos('Seriam incluídos', novos, (s) =>
       `${chaveDaSucata(s)} | loja ${s.CODEMP} | ${s.LOCALIDADE ?? ''} | ${kg(s.SALDO_KG)} | ${s.DIAS_NEGATIVO} dias no negativo`);
+    exemplos('Seriam completados', completar, (c) => `${c.chave} | ${Object.keys(c.props).join(', ')}`);
     exemplos('Seriam reabertos', reaberturas, (r) => `${r.chave} | ${kg(r.sucata.SALDO_KG)}`);
     exemplos('Seriam encerrados', encerramentos, (e) => `${e.chave} | ${e.motivo}`);
 
@@ -131,7 +162,7 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
   } else {
     await emParalelo(novos, async (sucata) => {
       try {
-        const pagina = await criarPagina(notion, base, sucata);
+        const pagina = await criarPagina(notion, base, sucata, vinculo(sucata.CODPARC));
         resumo.incluidos++;
         log(`  incluído ${chaveDaSucata(sucata)} -> página ${pagina.id}`);
       } catch (erro) {
@@ -140,9 +171,20 @@ export async function sincronizarSucata({ simular = false, notion = criarCliente
       }
     });
 
+    await emParalelo(completar, async ({ chave, pagina, props }) => {
+      try {
+        await atualizarPagina(notion, pagina, props);
+        resumo.completados++;
+        log(`  completado ${chave} (página ${pagina.id}): ${Object.keys(props).join(', ')}`);
+      } catch (erro) {
+        resumo.erros++;
+        log(`  ERRO ao completar ${chave} (página ${pagina.id}): ${erro.message}`);
+      }
+    });
+
     await emParalelo(reaberturas, async ({ chave, pagina, sucata }) => {
       try {
-        await atualizarPagina(notion, pagina, propsReabrir(sucata));
+        await atualizarPagina(notion, pagina, propsReabrir(pagina, sucata));
         resumo.reabertos++;
         log(`  reaberto ${chave} (página ${pagina.id}): voltou a dever ${kg(sucata.SALDO_KG)}`);
       } catch (erro) {

@@ -1,13 +1,14 @@
 /**
- * De-para entre os dados do título no Sankhya e as colunas da base "Posição de Cobrança"
- * no Notion, conforme o roteiro da equipe.
+ * De-para entre os dados do Sankhya e as colunas da base "Posição de Cobrança" no Notion,
+ * conforme o roteiro da equipe (seção 5, nomes atuais da base).
  *
  * - `nomes`: nomes aceitos para a coluna no Notion (usa o primeiro que existir;
- *   maiúsculas e acentos não importam).
+ *   maiúsculas, acentos e o que estiver entre parênteses não importam).
  * - O tipo da coluna (texto, número, data, seleção...) é lido do próprio Notion.
- * - Coluna que não existir na base é ignorada com um aviso.
- * - Os campos só são gravados quando o card é criado (fotografia da inclusão).
- *   O que a equipe preencher depois nunca é alterado pela automação.
+ * - Coluna obrigatória que não existir na base faz a rotina parar ANTES de gravar qualquer coisa
+ *   (assim uma coluna renomeada não gera cards incompletos). `opcional: true` só gera aviso.
+ * - Os campos são gravados quando o card é criado (fotografia da inclusão). Depois disso a
+ *   automação só preenche o que estiver vazio (vínculo com o cliente, vendedor, dados que faltaram).
  */
 
 // Coluna que identifica o card. Obrigatória na base.
@@ -15,8 +16,11 @@ export const COLUNA_CHAVE = 'Chave Sankhya';
 export const PREFIXO_CHAVE = 'TIT:';
 export const chaveDoTitulo = (t) => `${PREFIXO_CHAVE}${t.NUFIN}`;
 
-// Coluna de vencimento usada para avisar quando o Sankhya alterar o vencimento
-export const COLUNA_VENCIMENTO = 'Vencimento';
+// Colunas usadas pela lógica da rotina
+export const COLUNA_VENCIMENTO = 'Venc.';
+export const COLUNA_CLIENTE = 'Cliente'; // relação com a base por cliente
+export const COLUNA_PARCEIRO = 'Parceiro'; // CODPARC
+export const COLUNA_VENDEDOR = 'Vendedor';
 
 export const LOJAS = {
   1: 'Brasília',
@@ -42,36 +46,47 @@ export const POLOS = {
 // Tipos de título que indicam que o título já está com uma assessoria de cobrança
 export const ASSESSORIAS = {
   38: 'Uninova',
-  39: 'Consulte',
+  39: 'Consulth',
 };
 
 const texto = (v) => (v == null || String(v).trim() === '' ? null : String(v).trim());
 const codigo = (v) => (v == null ? null : String(v));
 
-export const CAMPOS = [
-  // Comuns
-  { nomes: ['Nome'], titulo: true, valor: (t) => texto(t.NOMEPARC) },
-  { nomes: ['Parceiro'], valor: (t) => texto(t.RAZAOSOCIAL) ?? texto(t.NOMEPARC) },
-  { nomes: [COLUNA_CHAVE], valor: chaveDoTitulo },
-  { nomes: ['Tipo de pendência'], valor: () => 'Título' },
+// Campos comuns a títulos e sucata
+const comuns = (tipo) => [
+  { nomes: ['Nome'], titulo: true, valor: (x) => texto(x.NOMEPARC) },
+  { nomes: ['Razão Social'], opcional: true, valor: (x) => texto(x.RAZAOSOCIAL) ?? texto(x.NOMEPARC) },
+  { nomes: [COLUNA_PARCEIRO, 'Código do parceiro'], valor: (x) => codigo(x.CODPARC) },
+  { nomes: ['Empresa', 'Código da empresa'], valor: (x) => codigo(x.CODEMP) },
+  { nomes: ['Loja'], valor: (x) => (LOJAS[x.CODEMP] ? `${x.CODEMP} — ${LOJAS[x.CODEMP]}` : null) },
+  { nomes: ['Polo de alinhamento'], valor: (x) => POLOS[x.CODEMP] ?? null },
+  { nomes: ['Tipo de pendência'], valor: () => tipo },
   { nomes: ['Situação da pendência'], valor: () => 'Em aberto' },
-  { nomes: ['Andamento da cobrança'], valor: () => 'A tratar' },
-  { nomes: ['Loja'], valor: (t) => LOJAS[t.CODEMP] ?? null },
-  { nomes: ['Polo de alinhamento'], valor: (t) => POLOS[t.CODEMP] ?? null },
-  { nomes: ['Código da empresa'], valor: (t) => codigo(t.CODEMP) },
-  { nomes: ['Código do parceiro'], valor: (t) => codigo(t.CODPARC) },
-  // Títulos
-  { nomes: ['Nro Único (NUFIN)', 'Nro Único', 'NUFIN'], valor: (t) => t.NUFIN },
-  { nomes: ['Nro Nota', 'Nro. Nota'], valor: (t) => (t.NUMNOTA ? t.NUMNOTA : null) },
-  { nomes: ['Desdobramento', 'Desdob.'], valor: (t) => texto(t.DESDOBRAMENTO) },
-  { nomes: [COLUNA_VENCIMENTO, 'Dt. Vencimento'], valor: (t) => t.DTVENC },
-  { nomes: ['Código de operação', 'Código da operação', 'TOP'], valor: (t) => codigo(t.CODTIPOPER) },
-  { nomes: ['Valor do desdobramento', 'Vlr. desdobramento', 'Vlr desdobramento', 'Valor desdobramento'], valor: (t) => t.VLRDESDOB },
-  { nomes: ['Valor líquido', 'Vlr. líquido', 'Vlr líquido'], valor: (t) => t.VLRLIQUIDO },
-  { nomes: ['Código do tipo de título', 'Código tipo de título', 'Cód. tipo de título'], valor: (t) => codigo(t.CODTIPTIT) },
-  { nomes: ['Tipo de título', 'Nome do tipo de título', 'Descrição do tipo de título'], valor: (t) => texto(t.DESCRTIPTIT) },
-  { nomes: ['Histórico', 'Histórico do Sankhya', 'Histórico Sankhya'], valor: (t) => texto(t.HISTORICO) },
-  { nomes: ['Assessoria'], valor: (t) => ASSESSORIAS[t.CODTIPTIT] ?? null },
+  { nomes: ['Andamento', 'Andamento da cobrança'], valor: () => 'A tratar' },
+];
+
+export const CAMPOS = [
+  ...comuns('Título'),
+  { nomes: [COLUNA_CHAVE], valor: chaveDoTitulo },
+  { nomes: ['Único', 'Nro Único (NUFIN)', 'Nro Único', 'NUFIN'], valor: (t) => codigo(t.NUFIN) },
+  { nomes: ['Nota', 'Nro Nota'], valor: (t) => (t.NUMNOTA ? codigo(t.NUMNOTA) : null) },
+  { nomes: ['Desd', 'Desdobramento'], valor: (t) => texto(t.DESDOBRAMENTO) },
+  { nomes: [COLUNA_VENCIMENTO, 'Vencimento'], valor: (t) => t.DTVENC },
+  { nomes: ['Operação', 'Código de operação'], valor: (t) => codigo(t.CODTIPOPER) },
+  { nomes: ['Valor', 'Valor do desdobramento'], valor: (t) => t.VLRDESDOB },
+  { nomes: ['Valor líquido (R$)', 'Valor líquido'], valor: (t) => t.VLRLIQUIDO },
+  { nomes: ['Cód. Tipo Título', 'Código do tipo de título'], valor: (t) => codigo(t.CODTIPTIT) },
+  { nomes: ['Tipo de título'], valor: (t) => texto(t.DESCRTIPTIT) },
+  { nomes: ['Histórico Sankhya', 'Histórico'], valor: (t) => texto(t.HISTORICO) },
+  { nomes: [COLUNA_VENDEDOR], valor: (t) => texto(t.VENDEDOR) },
+  { nomes: ['Assessoria'], opcional: true, valor: (t) => ASSESSORIAS[t.CODTIPTIT] ?? null },
+];
+
+// Campos que vêm do Sankhya: os únicos que a automação completa em cards já existentes (se vazios)
+export const CAMPOS_DO_ERP_TITULO = [
+  'Nome', 'Razão Social', COLUNA_PARCEIRO, 'Empresa', 'Loja', 'Polo de alinhamento',
+  'Único', 'Nota', 'Desd', COLUNA_VENCIMENTO, 'Operação', 'Valor', 'Valor líquido (R$)',
+  'Cód. Tipo Título', 'Tipo de título', 'Histórico Sankhya', COLUNA_VENDEDOR,
 ];
 
 // ---------- Sucata ----------
@@ -81,28 +96,25 @@ export const PREFIXO_SUCATA = 'SUC:';
 export const chaveDaSucata = (s) => `${PREFIXO_SUCATA}${s.CODPARC}`;
 
 export const CAMPOS_SUCATA = [
-  { nomes: ['Nome'], titulo: true, valor: (s) => texto(s.NOMEPARC) },
-  { nomes: ['Parceiro'], valor: (s) => texto(s.RAZAOSOCIAL) ?? texto(s.NOMEPARC) },
+  ...comuns('Sucata'),
   { nomes: [COLUNA_CHAVE], valor: chaveDaSucata },
-  { nomes: ['Tipo de pendência'], valor: () => 'Sucata' },
-  { nomes: ['Situação da pendência'], valor: () => 'Em aberto' },
-  { nomes: ['Andamento da cobrança'], valor: () => 'A tratar' },
-  { nomes: ['Loja'], valor: (s) => LOJAS[s.CODEMP] ?? null },
-  { nomes: ['Polo de alinhamento'], valor: (s) => POLOS[s.CODEMP] ?? null },
-  { nomes: ['Código da empresa'], valor: (s) => codigo(s.CODEMP) },
-  { nomes: ['Código do parceiro'], valor: (s) => codigo(s.CODPARC) },
   { nomes: ['Localidade'], valor: (s) => texto(s.LOCALIDADE) },
-  { nomes: ['Saldo de sucata (kg)'], valor: (s) => s.SALDO_KG },
+  { nomes: ['Saldo Sucata', 'Saldo de sucata (kg)'], valor: (s) => s.SALDO_KG },
   { nomes: ['Dias no negativo'], valor: (s) => s.DIAS_NEGATIVO },
+];
+
+export const CAMPOS_DO_ERP_SUCATA = [
+  'Nome', 'Razão Social', COLUNA_PARCEIRO, 'Empresa', 'Loja', 'Polo de alinhamento',
+  'Localidade', 'Saldo Sucata', 'Dias no negativo',
 ];
 
 // Colunas usadas para encerrar e reabrir pendências de sucata
 export const SUCATA_ENCERRAMENTO = {
   situacao: 'Situação da pendência',
-  andamento: 'Andamento da cobrança',
+  andamento: 'Andamento',
   motivo: 'Motivo do encerramento',
   data: 'Data de encerramento',
-  saldo: 'Saldo de sucata (kg)',
+  saldo: 'Saldo Sucata',
   dias: 'Dias no negativo',
 };
 

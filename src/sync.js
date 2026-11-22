@@ -2,68 +2,88 @@
  * Rotina diária de TÍTULOS: Sankhya -> base "Posição de Cobrança" no Notion.
  *
  * 1. Lê a carteira inteira no Sankhya: a receber, em aberto, cliente externo, empresas 1 a 9,
- *    tudo que vence até hoje + DIAS_A_VENCER (a vencer e vencidos). O Notion separa as visões
- *    sozinho pela "Faixa de vencimento". Se a leitura falhar, para sem mexer no Notion.
- * 2. Lê todos os cards de títulos do Notion (Chave Sankhya = TIT:<NUFIN>).
- * 3. Chave nova -> cria o card (Em aberto / A tratar + cabeçalho "Histórico de tratativas").
- *    Chave que já existe -> não altera nada (fotografia da inclusão).
+ *    vencimento até ontem (data de Brasília). O Notion separa sozinho, pela "Faixa de vencimento",
+ *    as visões de 1 a 7 dias e de +7 dias. Se a leitura falhar, para sem mexer no Notion.
+ * 2. Lê todos os cards de títulos do Notion (Chave Sankhya = TIT:<NUFIN>) e a base de clientes.
+ * 3. Chave nova -> garante o cliente e cria o card já com o vínculo (Em aberto / A tratar +
+ *    cabeçalho "Histórico de tratativas").
+ *    Chave que já existe -> preserva tudo; só completa o que estiver vazio (vínculo com o cliente,
+ *    vendedor e campos do Sankhya que faltaram).
  * 4. Card cujo título saiu da carteira -> confere o NUFIN no Sankhya:
  *    - baixa integral confirmada: manda o card para a lixeira;
- *    - baixa parcial, renegociação, título não encontrado ou vencimento alterado:
+ *    - vencimento hoje ou futuro e o card entrou assim (carga antiga de "a vencer"): lixeira;
+ *    - baixa parcial, renegociação, título não encontrado, vencimento repactuado:
  *      mantém o card e registra a exceção para revisão.
  */
 import { config } from './config.js';
-import { chaveDoTitulo, LOJAS, POLOS } from './campos.js';
-import { buscarTitulosVencidos, consultarSituacao } from './titulos.js';
 import {
-  criarClienteNotion, abrirBase, listarPaginas, vencimentoNoNotion,
-  montarPropriedades, criarPagina, excluirPagina,
+  chaveDoTitulo, LOJAS, POLOS, CAMPOS_DO_ERP_TITULO, COLUNA_PARCEIRO, COLUNA_VENDEDOR,
+} from './campos.js';
+import { buscarTitulosVencidos, buscarTitulosPorNufin, consultarSituacao } from './titulos.js';
+import {
+  criarClienteNotion, abrirBase, listarPaginas, vencimentoNoNotion, valorDaColuna,
+  montarPropriedades, criarPagina, atualizarPagina, excluirPagina,
+  camposParaCompletar, clientesDaPagina, propriedadeCliente,
 } from './notion.js';
-import { agora, log, dataBR, brl, emParalelo, salvarPlanilha } from './util.js';
+import { abrirClientes, garantirClientes } from './clientes.js';
+import { agora, hojeISO, log, dataBR, brl, emParalelo, salvarPlanilha } from './util.js';
 
 function descreverRegra() {
-  const prazo = config.diasAVencer > 0
-    ? `vencidos e a vencer até ${config.diasAVencer} dias`
-    : `vencidos há mais de ${config.diasAtraso} dias`;
-  return `empresas ${config.empresas.join(',')} | a receber | em aberto | cliente externo | ${prazo}` +
+  return `empresas ${config.empresas.join(',')} | a receber | em aberto | cliente externo | vencimento até ontem` +
     (config.diasAtrasoMaximo != null ? ` | atraso máximo ${config.diasAtrasoMaximo} dias` : '') +
     (config.tiposTitulo.length ? ` | só tipos ${config.tiposTitulo.join(',')}` : '') +
     (config.tiposTituloIgnorar.length ? ` | sem os tipos ${config.tiposTituloIgnorar.join(',')}` : '') +
     (config.parceirosIgnorar.length ? ` | sem os parceiros ${config.parceirosIgnorar.join(',')}` : '');
 }
 
+const dataCriacao = (pagina) =>
+  new Date(pagina.created_time).toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+
 /** Decide o que fazer com um card cujo título não veio na carteira de hoje. */
-function classificarSaida(s) {
+function classificarSaida(s, pagina, vencNotion) {
   if (!s) return { manter: 'título não encontrado no Sankhya (excluído ou estornado?)' };
+  // Card que entrou antes de vencer (carga antiga de "a vencer") e cujo vencimento, confirmado
+  // na origem, é hoje ou futuro: não pertence à carteira de vencidos até ontem
+  if (!s.baixado && s.vencimento && s.vencimento >= hojeISO() && (!vencNotion || vencNotion >= dataCriacao(pagina))) {
+    return { remover: `vence em ${dataBR(s.vencimento)}: fora da carga de vencidos até ontem`, tipo: 'correcao' };
+  }
   if (s.renegociado) {
     return { manter: `título renegociado${s.nuReneg ? ` (renegociação ${s.nuReneg})` : ''}; validar com o financeiro` };
   }
   if (s.baixado && s.nufinSaldo) {
     return { manter: `baixa parcial em ${dataBR(s.dataBaixa)}; saldo em aberto no NUFIN ${s.nufinSaldo}` };
   }
-  if (s.baixado) return { remover: `baixa integral em ${dataBR(s.dataBaixa)} (${brl(s.valorBaixa)})` };
+  if (s.baixado) return { remover: `baixa integral em ${dataBR(s.dataBaixa)} (${brl(s.valorBaixa)})`, tipo: 'baixa' };
+  if (s.passouParaCartao) {
+    return { remover: `pago no cartão: o título passou para a operadora (parceiro ${s.codparc})`, tipo: 'cartao' };
+  }
+  if (!s.receita) {
+    return { manter: `deixou de ser título a receber do cliente (RECDESP=${s.recdesp}, parceiro ${s.codparc}); validar com o financeiro` };
+  }
   if (s.naCarteira) return { manter: 'em aberto e dentro da regra, mas não veio na consulta de hoje' };
-  return { manter: `em aberto, mas saiu da regra (vencimento atual ${dataBR(s.vencimento)})` };
-}
 
-function faixa(diasAtraso) {
-  if (diasAtraso < 0) return 'A vencer';
-  if (diasAtraso === 0) return 'Vence hoje';
-  if (diasAtraso <= 7) return 'Vencido até 7 dias';
-  return 'Vencido há mais de 7 dias';
+  // Em aberto e fora da carteira porque vence hoje ou depois
+  if (s.vencimento && s.vencimento >= hojeISO()) {
+    // Entrou no Notion antes de vencer (carga antiga de "a vencer"): sai da base
+    if (!vencNotion || vencNotion >= dataCriacao(pagina)) {
+      return { remover: `vence em ${dataBR(s.vencimento)}: fora da carga de vencidos até ontem`, tipo: 'correcao' };
+    }
+    // Já estava vencido quando entrou e o vencimento foi para frente: repactuado
+    return { manter: `vencimento repactuado: ${dataBR(vencNotion)} -> ${dataBR(s.vencimento)}` };
+  }
+  return { manter: `em aberto, mas saiu da regra (vencimento atual ${dataBR(s.vencimento)})` };
 }
 
 function planilhaConferencia(novos, remocoes, excecoes) {
   const linhas = [[
-    'Ação', 'Chave Sankhya', 'Faixa', 'Código da empresa', 'Loja', 'Polo', 'Cliente', 'Código do parceiro',
-    'Nro Nota', 'Desdobramento', 'Vencimento', 'Dias de atraso', 'Valor do desdobramento',
-    'Valor líquido', 'Tipo de título', 'Código de operação', 'Histórico', 'Motivo',
+    'Ação', 'Chave Sankhya', 'Dias de atraso', 'Empresa', 'Loja', 'Polo', 'Cliente', 'Parceiro',
+    'Nota', 'Desd', 'Venc.', 'Valor', 'Valor líquido', 'Tipo de título', 'Operação', 'Vendedor', 'Histórico', 'Motivo',
   ]];
   for (const t of novos) {
     linhas.push([
-      'Incluir', chaveDoTitulo(t), faixa(t.DIAS_ATRASO), t.CODEMP, LOJAS[t.CODEMP] ?? '', POLOS[t.CODEMP] ?? '',
-      t.NOMEPARC, t.CODPARC, t.NUMNOTA || '', t.DESDOBRAMENTO, dataBR(t.DTVENC), t.DIAS_ATRASO,
-      t.VLRDESDOB, t.VLRLIQUIDO, `${t.CODTIPTIT} - ${t.DESCRTIPTIT ?? ''}`, t.CODTIPOPER, t.HISTORICO, '',
+      'Incluir', chaveDoTitulo(t), t.DIAS_ATRASO, t.CODEMP, LOJAS[t.CODEMP] ?? '', POLOS[t.CODEMP] ?? '',
+      t.NOMEPARC, t.CODPARC, t.NUMNOTA || '', t.DESDOBRAMENTO, dataBR(t.DTVENC), t.VLRDESDOB, t.VLRLIQUIDO,
+      `${t.CODTIPTIT} - ${t.DESCRTIPTIT ?? ''}`, t.CODTIPOPER, t.VENDEDOR ?? '', t.HISTORICO, '',
     ]);
   }
   for (const r of remocoes) linhas.push(['Remover', r.chave, ...Array(15).fill(''), r.motivo]);
@@ -75,7 +95,7 @@ export function mostrarCard(chave, props) {
   log(`Exemplo de card (${chave}):`);
   for (const [coluna, v] of Object.entries(props)) {
     const valor = v.title?.[0]?.text.content ?? v.rich_text?.[0]?.text.content ?? v.select?.name ??
-      v.status?.name ?? v.date?.start ?? v.number ?? '(vazio)';
+      v.status?.name ?? v.date?.start ?? v.number ?? (v.relation ? `vínculo ${v.relation[0]?.id}` : '(vazio)');
     log(`  ${coluna.padEnd(28)} ${String(valor).slice(0, 90)}`);
   }
 }
@@ -87,12 +107,14 @@ export async function sincronizarTitulos({ simular = false, notion = criarClient
   const base = await abrirBase(notion);
   log(`Notion: "${base.nome}" | ${base.colunas.length} colunas preenchidas na inclusão`);
   for (const aviso of base.avisos) log(`  aviso: ${aviso}`);
+  const clientes = await abrirClientes(notion, base);
+  if (clientes.aviso) log(`  aviso: vínculo com clientes desligado: ${clientes.aviso}`);
+  else log(`Notion: base de clientes com ${clientes.porCodigo.size} clientes`);
 
   // Leituras completas antes de qualquer gravação
   const titulos = await buscarTitulosVencidos();
-  const porFaixa = {};
-  for (const t of titulos) porFaixa[faixa(t.DIAS_ATRASO)] = (porFaixa[faixa(t.DIAS_ATRASO)] ?? 0) + 1;
-  log(`Sankhya: ${titulos.length} títulos na carteira ${JSON.stringify(porFaixa)}`);
+  const ate7 = titulos.filter((t) => t.DIAS_ATRASO <= 7).length;
+  log(`Sankhya: ${titulos.length} títulos na carteira (${ate7} de 1 a 7 dias, ${titulos.length - ate7} com +7 dias)`);
   const { porChave, duplicadas } = await listarPaginas(notion, base);
   log(`Notion: ${porChave.size + duplicadas.size} chaves de títulos na base`);
 
@@ -101,11 +123,14 @@ export async function sincronizarTitulos({ simular = false, notion = criarClient
   for (const [chave, paginas] of duplicadas) {
     excecao(chave, `chave repetida em ${paginas.length} cards; nenhum deles foi alterado`);
   }
+  for (const codigo of clientes.conflitos ?? []) {
+    excecao(`CLIENTE:${codigo}`, 'código de parceiro repetido em mais de um cliente na base de clientes');
+  }
 
   // Inclusões
   const naCarteira = new Map(titulos.map((t) => [chaveDoTitulo(t), t]));
   const novos = [];
-  let jaExistentes = 0;
+  const existentes = [];
   for (const [chave, titulo] of naCarteira) {
     if (duplicadas.has(chave)) continue;
     const existente = porChave.get(chave);
@@ -113,7 +138,7 @@ export async function sincronizarTitulos({ simular = false, notion = criarClient
       novos.push(titulo);
       continue;
     }
-    jaExistentes++;
+    existentes.push({ chave, ...existente });
     const vencNotion = vencimentoNoNotion(base, existente.pagina);
     if (vencNotion && vencNotion !== titulo.DTVENC) {
       excecao(chave, `vencimento mudou no Sankhya: ${dataBR(vencNotion)} -> ${dataBR(titulo.DTVENC)}`);
@@ -124,13 +149,55 @@ export async function sincronizarTitulos({ simular = false, notion = criarClient
   const fora = [...porChave].filter(([chave]) => !naCarteira.has(chave));
   const situacao = fora.length > 0 ? await consultarSituacao(fora.map(([, v]) => v.id)) : new Map();
   const remocoes = [];
+  const mantidosFora = [];
   for (const [chave, { id: nufin, pagina }] of fora) {
-    const decisao = classificarSaida(situacao.get(nufin));
-    if (decisao.remover) remocoes.push({ chave, pagina, motivo: decisao.remover });
-    else excecao(chave, `${decisao.manter}; card mantido`);
+    const decisao = classificarSaida(situacao.get(nufin), pagina, vencimentoNoNotion(base, pagina));
+    if (decisao.remover) remocoes.push({ chave, pagina, motivo: decisao.remover, tipo: decisao.tipo });
+    else {
+      excecao(chave, `${decisao.manter}; card mantido`);
+      mantidosFora.push({ chave, id: nufin, pagina });
+    }
   }
 
-  log(`Plano: incluir ${novos.length} | já existentes ${jaExistentes} | remover ${remocoes.length} | exceções ${excecoes.length}`);
+  // Completar cards que ficam: vínculo com cliente, vendedor e campos do Sankhya vazios
+  const ficam = [...existentes, ...mantidosFora];
+  const precisa = ficam.filter(({ pagina }) =>
+    (!clientes.aviso && clientesDaPagina(base, pagina).length === 0) ||
+    CAMPOS_DO_ERP_TITULO.some((nome) => valorDaColuna(base, pagina, nome) == null) ||
+    !/^\d+$/.test(String(valorDaColuna(base, pagina, COLUNA_PARCEIRO) ?? '')));
+  const dados = precisa.length > 0 ? await buscarTitulosPorNufin(precisa.map((p) => p.id)) : new Map();
+
+  // Clientes: resolve todos antes de gravar qualquer pendência
+  if (!clientes.aviso) {
+    const pedidos = [...novos, ...precisa.map((p) => dados.get(p.id)).filter(Boolean)]
+      .map((t) => ({ codigo: t.CODPARC, nome: t.NOMEPARC }));
+    const r = await garantirClientes(notion, clientes, pedidos, { simular });
+    log(`Clientes: ${r.faltavam} a criar${simular ? '' : ` | criados ${r.criados} | erros ${r.erros}`}`);
+  }
+  const vinculo = (codparc) => (clientes.aviso ? {} : propriedadeCliente(base, clientes.porCodigo.get(String(codparc))));
+
+  const completar = [];
+  const contagem = {};
+  for (const { chave, id, pagina } of precisa) {
+    const titulo = dados.get(id);
+    if (!titulo) continue;
+    const props = camposParaCompletar(base, pagina, titulo, CAMPOS_DO_ERP_TITULO, COLUNA_PARCEIRO);
+    if (!clientes.aviso && clientesDaPagina(base, pagina).length === 0) Object.assign(props, vinculo(titulo.CODPARC));
+    if (Object.keys(props).length === 0) continue;
+    for (const nome of Object.keys(props)) contagem[nome] = (contagem[nome] ?? 0) + 1;
+    completar.push({ chave, pagina, props });
+  }
+
+  const semVendedor = novos.filter((t) => !t.VENDEDOR);
+  log(`Plano: incluir ${novos.length} | já existentes ${existentes.length} | completar ${completar.length} ` +
+    `${JSON.stringify(contagem)} | remover ${remocoes.length} ` +
+    `(${remocoes.filter((r) => r.tipo === 'baixa').length} baixas, ${remocoes.filter((r) => r.tipo === 'cartao').length} pagos no cartão, ` +
+    `${remocoes.filter((r) => r.tipo === 'correcao').length} a vencer/vence hoje) ` +
+    `| exceções ${excecoes.length}`);
+  if (semVendedor.length > 0) {
+    log(`  sem vendedor identificado na origem (campo fica vazio): ${semVendedor.length} novos, ex.: ` +
+      semVendedor.slice(0, 5).map(chaveDoTitulo).join(', '));
+  }
 
   const resumo = {
     horario: agora(),
@@ -138,7 +205,8 @@ export async function sincronizarTitulos({ simular = false, notion = criarClient
     simulacao: simular,
     consultados: titulos.length,
     incluidos: 0,
-    jaExistentes,
+    jaExistentes: existentes.length,
+    completados: 0,
     removidos: 0,
     excecoes: excecoes.length,
     erros: 0,
@@ -151,22 +219,32 @@ export async function sincronizarTitulos({ simular = false, notion = criarClient
       for (const item of lista.slice(0, 15)) log(`  ${descrever(item)}`);
     };
     exemplos('Seriam incluídos', novos, (t) =>
-      `${chaveDoTitulo(t)} | ${faixa(t.DIAS_ATRASO)} | empresa ${t.CODEMP} | venc ${dataBR(t.DTVENC)} | ${brl(t.VLRDESDOB)} | ${t.DESCRTIPTIT ?? ''}`);
+      `${chaveDoTitulo(t)} | ${t.DIAS_ATRASO} dias | empresa ${t.CODEMP} | venc ${dataBR(t.DTVENC)} | ${brl(t.VLRDESDOB)} | ${t.VENDEDOR ?? '(sem vendedor)'}`);
+    exemplos('Seriam completados', completar, (c) => `${c.chave} | ${Object.keys(c.props).join(', ')}`);
     exemplos('Seriam removidos', remocoes, (r) => `${r.chave} | ${r.motivo}`);
-
-    // Monta os cards sem gravar, para conferir as opções das colunas de seleção
     const cards = novos.map((t) => montarPropriedades(base, t));
     if (cards[0]) mostrarCard(chaveDoTitulo(novos[0]), cards[0]);
     log(`Planilha da conferência: ${await planilhaConferencia(novos, remocoes, excecoes)}`);
   } else {
     await emParalelo(novos, async (titulo) => {
       try {
-        const pagina = await criarPagina(notion, base, titulo);
+        const pagina = await criarPagina(notion, base, titulo, vinculo(titulo.CODPARC));
         resumo.incluidos++;
         log(`  incluído ${chaveDoTitulo(titulo)} -> página ${pagina.id}`);
       } catch (erro) {
         resumo.erros++;
         log(`  ERRO ao incluir ${chaveDoTitulo(titulo)}: ${erro.message}`);
+      }
+    });
+
+    await emParalelo(completar, async ({ chave, pagina, props }) => {
+      try {
+        await atualizarPagina(notion, pagina, props);
+        resumo.completados++;
+        log(`  completado ${chave} (página ${pagina.id}): ${Object.keys(props).join(', ')}`);
+      } catch (erro) {
+        resumo.erros++;
+        log(`  ERRO ao completar ${chave} (página ${pagina.id}): ${erro.message}`);
       }
     });
 
